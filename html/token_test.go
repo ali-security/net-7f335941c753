@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,72 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestParseRenderDuplicateAttributes(t *testing.T) {
+	// Duplicate attribute names (compared ASCII case-insensitively) must be
+	// dropped during tokenization, keeping the first occurrence, so that a
+	// parse/render round trip cannot smuggle a second value for an attribute
+	// past a sanitizer that only inspected the first one.
+	tests := []struct {
+		in, want string
+	}{
+		{
+			`<a href="https://example.com/" href="javascript:alert(1)">x</a>`,
+			`<html><head></head><body><a href="https://example.com/">x</a></body></html>`,
+		},
+		{
+			`<img src="a.png" SRC="b.png" Src="c.png"/>`,
+			`<html><head></head><body><img src="a.png"/></body></html>`,
+		},
+		{
+			`<div title="a" onclick="" ONCLICK="alert(1)" title="b">`,
+			`<html><head></head><body><div title="a" onclick=""></div></body></html>`,
+		},
+	}
+	for _, tc := range tests {
+		doc, err := Parse(strings.NewReader(tc.in))
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.in, err)
+		}
+		var b strings.Builder
+		if err := Render(&b, doc); err != nil {
+			t.Fatalf("Render(%q): %v", tc.in, err)
+		}
+		if got := b.String(); got != tc.want {
+			t.Errorf("Parse+Render(%q):\ngot  %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+
+	// Each tag starts with a fresh set of seen attribute names.
+	z := NewTokenizer(strings.NewReader(`<p id="a" id="b"><p ID="c">`))
+	for _, want := range []string{"a", "c"} {
+		if tt := z.Next(); tt != StartTagToken {
+			t.Fatalf("expected StartTagToken, got %s", tt)
+		}
+		tok := z.Token()
+		if len(tok.Attr) != 1 || tok.Attr[0].Key != "id" || tok.Attr[0].Val != want {
+			t.Errorf("got attributes %v, want [id=%q]", tok.Attr, want)
+		}
+	}
+}
