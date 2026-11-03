@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/html/atom"
 )
@@ -541,6 +542,130 @@ func TestDepthLimit(t *testing.T) {
 			} else if !tc.succeed && err == nil {
 				t.Errorf("unexpected success")
 			}
+		})
+	}
+}
+
+func TestNoahsArkClauseAttributes(t *testing.T) {
+	// The Noah's Ark clause treats formatting elements as identical when they
+	// have the same tag name and the same set of attributes: the order of the
+	// attributes is irrelevant, but their names and values are not. Only three
+	// identical elements are kept in the list of active formatting elements, so
+	// the second <p> reconstructs at most three identical <b> elements.
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  int
+	}{
+		{"no attributes", `<p><b><b><b><b><p>x`, 3},
+		{"same order", `<p><b x=1 y=2><b x=1 y=2><b x=1 y=2><b x=1 y=2><p>x`, 3},
+		{"different order", `<p><b x=1 y=2><b y=2 x=1><b x=1 y=2><b y=2 x=1><p>x`, 3},
+		{"different values", `<p><b x=1 y=2><b y=2 x=3><b x=1 y=2><b y=4 x=1><p>x`, 4},
+		{"different keys", `<p><b x=1 y=2><b z=2 x=1><b x=1 y=2><b y=1 x=2><p>x`, 4},
+		{"different lengths", `<p><b x=1 y=2><b x=1><b y=2 x=1><b y=2 x=1 z=3><p>x`, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse(strings.NewReader(tc.input))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			body := doc.FirstChild.LastChild
+			p := body.LastChild
+			if p == nil || p.DataAtom != atom.P {
+				t.Fatalf("got last body child %v, want <p>", p)
+			}
+			got := 0
+			for n := p.FirstChild; n != nil && n.DataAtom == atom.B; n = n.FirstChild {
+				got++
+			}
+			if got != tc.want {
+				t.Errorf("got %d reconstructed <b> elements, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFormattingElementAttributeComparisonComplexity(t *testing.T) {
+	// Implementing the Noah's Ark clause compares the attributes of every new
+	// formatting element against those of the active formatting elements with
+	// the same tag. That comparison must not be quadratic in the number of
+	// attributes, otherwise a small document with formatting elements carrying
+	// many attributes consumes excessive CPU time.
+	//
+	// The time taken to parse such a document is compared against parsing the
+	// same document with a non-formatting element (which tokenizes the exact
+	// same attributes but skips the Noah's Ark clause), so the check does not
+	// depend on the speed of the machine.
+	attrs := func(n int, extra string) string {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, " a%d", i)
+		}
+		b.WriteString(extra)
+		return b.String()
+	}
+	// manyAttributes is two formatting elements, each with many attributes.
+	manyAttributes := func(tag string) string {
+		a := attrs(100000, "")
+		return "<" + tag + a + "><" + tag + a + ">x"
+	}
+	// manyElements is many formatting elements with many attributes, which
+	// differ only in their last attribute so that none of them is removed
+	// from the list of active formatting elements.
+	manyElements := func(tag string) string {
+		var b strings.Builder
+		for i := 0; i < 64; i++ {
+			fmt.Fprintf(&b, "<%s%s>", tag, attrs(2000, fmt.Sprintf(" z=%d", i)))
+		}
+		b.WriteString("x")
+		return b.String()
+	}
+	parse := func(s string) error {
+		_, err := Parse(strings.NewReader(s))
+		return err
+	}
+	parseFragment := func(s string) error {
+		_, err := ParseFragment(strings.NewReader(s), &Node{
+			Type:     ElementNode,
+			Data:     "body",
+			DataAtom: atom.Body,
+		})
+		return err
+	}
+	for _, tc := range []struct {
+		name  string
+		input func(tag string) string
+		parse func(string) error
+	}{
+		{"Parse/many attributes", manyAttributes, parse},
+		{"Parse/many elements", manyElements, parse},
+		{"ParseFragment/many attributes", manyAttributes, parseFragment},
+		{"ParseFragment/many elements", manyElements, parseFragment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			measure := func(s string) time.Duration {
+				start := time.Now()
+				if err := tc.parse(s); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return time.Since(start)
+			}
+			const attempts = 3
+			// Baseline: the same attributes on a non-formatting element.
+			span := tc.input("span")
+			baseline := measure(span)
+			for i := 1; i < attempts; i++ {
+				baseline = min(baseline, measure(span))
+			}
+			limit := 10*baseline + 250*time.Millisecond
+			formatting := tc.input("b")
+			var elapsed time.Duration
+			for i := 0; i < attempts; i++ {
+				if elapsed = measure(formatting); elapsed <= limit {
+					return
+				}
+			}
+			t.Errorf("parsing formatting elements took %v, want <= %v (non-formatting elements took %v)", elapsed, limit, baseline)
 		})
 	}
 }
