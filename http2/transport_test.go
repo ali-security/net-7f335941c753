@@ -5959,3 +5959,20 @@ func testExtendedConnectReadFrameError(t testing.TB) {
 		t.Fatalf("after connection closed: RoundTrip succeeded; want error")
 	}
 }
+
+func TestTransportDoNotHangOnZeroMaxFrameSize(t *testing.T) {
+	synctestTest(t, testTransportDoNotHangOnZeroMaxFrameSize)
+}
+func testTransportDoNotHangOnZeroMaxFrameSize(t testing.TB) {
+	tc := newTestClientConn(t)
+	tc.wantFrameType(FrameSettings)
+	tc.wantFrameType(FrameWindowUpdate)
+
+	tc.writeSettings(Setting{ID: SettingMaxFrameSize, Val: 0})
+
+	req, _ := http.NewRequest("POST", "https://dummy.tld/", strings.NewReader("body"))
+	rt := tc.roundTrip(req)
+	if rt.err() == nil {
+		t.Fatalf("expected error for zero max frame size")
+	}
+}
