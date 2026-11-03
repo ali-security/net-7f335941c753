@@ -1,0 +1,126 @@
+name: seal-build
+
+# golang.org/x/net ships no GitHub Actions CI (upstream tests on Go's LUCI
+# builders via Gerrit). This workflow reproduces the proxy.golang.org module
+# zip and runs the module's own `go test ./...` suite.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run; empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MODULE_PATH: golang.org/x/net
+      MODULE_VERSION: v0.45.0
+      GOTOOLCHAIN: local
+      TEST_FILTER: ${{ inputs.test-filter }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # go.mod declares `go 1.24.0`, but the http2 and internal/http3 suites are
+          # gated on `//go:build go1.25 || goexperiment.synctest`; Go 1.25 was the
+          # current release when v0.45.0 shipped, so it runs the whole suite.
+          go-version: "1.25"
+          cache: false
+
+      - name: Go version
+        run: go version && go env
+
+      - name: Produce module zip
+        run: |
+          set -euo pipefail
+          # Pack from a copy of the tree without this CI workflow (upstream ships no .github),
+          # using golang.org/x/mod/zip.CreateFromDir — the proxy's own inclusion rules.
+          SRC="$RUNNER_TEMP/modsrc"
+          mkdir -p "$SRC"
+          git ls-files -z --cached --others --exclude-standard | grep -zv '^\.github/' | xargs -0 cp --parents -t "$SRC"
+          HELPER="$RUNNER_TEMP/zipper"
+          mkdir -p "$HELPER" "$RUNNER_TEMP/out"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          cd "$HELPER"
+          go mod init example.com/zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$SRC" "$RUNNER_TEMP/out/$MODULE_VERSION.zip"
+          unzip -l "$RUNNER_TEMP/out/$MODULE_VERSION.zip" | tail -3
+
+      - name: Build
+        run: go build ./...
+
+      - name: Configure loopback for the ipv4/ipv6/icmp network tests
+        run: |
+          set -euo pipefail
+          # Hosted runners disable IPv6 on lo and restrict unprivileged ICMP
+          # sockets; the ipv6/icmp tests skip on each of these.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          ip -6 addr show dev lo | grep -q '::1' || sudo ip -6 addr add ::1/128 dev lo
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip addr show dev lo
+          echo "NOTE: lo is left without the MULTICAST flag: with it set, the source-specific subtest"
+          echo "      ipv4 TestPacketConnReadWriteMulticastUDP/addr=232.0.1.0:0/grp=232.0.1.254/src=127.0.0.1"
+          echo "      never receives its datagram on the hosted-runner kernel and hangs until the 10m package timeout,"
+          echo "      so that test skips with 'no available interface' (no routed multicast-capable interface on the runner)."
+
+      - name: Test
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            # -json keeps every test's output attached to its name, so each skip
+            # is reported with its full reason after the run.
+            J="$RUNNER_TEMP/full.json"
+            go test -json ./... | tee "$J" | jq -rj 'select(.Action == "output") | .Output'
+            echo "==== SKIPPED TESTS (package.test: reason) ===="
+            jq -rs '[.[] | select(.Test != null)] | group_by(.Package + " " + .Test) | .[]
+              | select(any(.[]; .Action == "skip"))
+              | "SKIP \(.[0].Package).\(.[0].Test): " + ([.[] | select(.Action == "output") | .Output
+                  | select(test("^\\s*(=== |--- |$)") | not) | sub("^\\s+"; "") | sub("\\s+$"; "")] | join(" | "))' "$J"
+            P=$(jq -s '[.[] | select(.Test != null and .Action == "pass")] | length' "$J")
+            F=$(jq -s '[.[] | select(.Test != null and .Action == "fail")] | length' "$J")
+            S=$(jq -s '[.[] | select(.Test != null and .Action == "skip")] | length' "$J")
+            echo "TEST SUMMARY: $P passed, $F failed, $S skipped"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
